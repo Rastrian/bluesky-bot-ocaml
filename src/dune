@@ -1,0 +1,4 @@
+(executable
+ (name main)
+ (libraries lwt lwt.unix cohttp-lwt-unix yojson redis-lwt logs fmt ptime ptime.clock.os str tls tls-lwt conduit-lwt-unix ssl ipaddr)
+ (preprocess (pps lwt_ppx)))

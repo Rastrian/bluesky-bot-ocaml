@@ -1,0 +1,38 @@
+name: CI/CD
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v2
+
+    - name: Set up OCaml
+      uses: ocaml/setup-ocaml@v2
+      with:
+        ocaml-compiler: 5.1.x
+
+    - name: Cache OPAM
+      uses: actions/cache@v3
+      with:
+        path: ~/.opam
+        key: ${{ runner.os }}-opam-${{ hashFiles('**/*.opam') }}
+        restore-keys: |
+          ${{ runner.os }}-opam-
+
+    - name: Install Dune and Required Libraries
+      run: |
+        opam install dune lwt cohttp-lwt-unix yojson redis-lwt logs fmt ptime lwt_ppx tls tls-lwt conduit-lwt-unix ssl ipaddr -y
+        eval $(opam env)
+
+    - name: Install dependencies
+      run: opam install . --deps-only
+
+    - name: Build project
+      run: opam exec -- dune build
