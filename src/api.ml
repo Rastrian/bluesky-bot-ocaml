@@ -3,10 +3,28 @@ open Yojson.Safe
 open Utils
 open Ptime_clock
 
-let () =
-  Ssl.init ()
+let () = Ssl.init ()
 
 let api_url = "https://bsky.social/xrpc"
+
+let make_request ~method_ ~headers ?body uri =
+  let open Cohttp_lwt_unix.Client in
+  (match method_ with
+   | `GET -> get ~headers uri
+   | `POST -> post ~headers ?body uri)
+  >>= fun (resp, body) ->
+  Cohttp_lwt.Body.to_string body >>= fun body_str ->
+  let status_code = Cohttp.Response.status resp |> Cohttp.Code.code_of_status in
+  Lwt.return (status_code, body_str)
+
+let handle_response ~action (status_code, body_str) =
+  Logs.debug (fun m -> m "Response for %s received: %s" action body_str);
+  if status_code = 200 then
+    Ok (from_string body_str)
+  else (
+    Logs.err (fun m -> m "Failed to %s. Status code: %d, Response: %s" action status_code body_str);
+    Error "API request failed"
+  )
 
 let get_access_token () =
   Logs.info (fun m -> m "Requesting access token...");
@@ -14,159 +32,108 @@ let get_access_token () =
   let password = get_env_var "PASSWORD" in
   let body = `Assoc [("identifier", `String identifier); ("password", `String password)] |> to_string in
   let headers = Cohttp.Header.of_list [("Content-Type", "application/json")] in
+  make_request ~method_:`POST ~headers ~body:(Cohttp_lwt.Body.of_string body)
+    (Uri.of_string (api_url ^ "/com.atproto.server.createSession"))
+  >>= fun response ->
+  match handle_response ~action:"retrieve access token" response with
+  | Ok json ->
+      let token = Util.(json |> member "accessJwt" |> to_string) in
+      let did = Util.(json |> member "did" |> to_string) in
+      Logs.info (fun m -> m "Access token retrieved successfully.");
+      Lwt.return (token, did)
+  | Error e -> Lwt.fail_with e
 
-  Cohttp_lwt_unix.Client.post ~headers ~body:(Cohttp_lwt.Body.of_string body) (Uri.of_string (api_url ^ "/com.atproto.server.createSession"))
-  >>= fun (resp, body) ->
-  Cohttp_lwt.Body.to_string body >|= fun body_str ->
-  Logs.debug (fun m -> m "Response for access token received: %s" body_str);
-  if Cohttp.Response.status resp |> Cohttp.Code.code_of_status = 200 then
-    let json = from_string body_str in
-    let token = Util.(json |> member "accessJwt" |> to_string) in
-    let did = Util.(json |> member "did" |> to_string) in
-    Logs.info (fun m -> m "Access token retrieved successfully.");
-    (token, did)
-  else (
-    Logs.err (fun m -> m "Failed to retrieve access token. Response: %s" body_str);
-    failwith "Failed to get access token"
-  )
+let rec fetch_paginated_data token did endpoint cursor_key acc =
+  Logs.info (fun m -> m "Fetching data from %s..." endpoint);
+  let headers = Cohttp.Header.of_list [("Authorization", "Bearer " ^ token)] in
+  let uri = match cursor_key with
+    | None -> Uri.of_string (api_url ^ endpoint ^ "?actor=" ^ did)
+    | Some cursor -> Uri.of_string (api_url ^ endpoint ^ "?actor=" ^ did ^ "&cursor=" ^ cursor)
+  in
+  make_request ~method_:`GET ~headers uri
+  >>= fun response ->
+  match handle_response ~action:("retrieve " ^ endpoint) response with
+  | Ok json ->
+      let new_data = Util.(json |> member (if endpoint = "/app.bsky.graph.getFollowers" then "followers" else "follows") |> to_list) in
+      let all_data = acc @ new_data in
+      Logs.info (fun m -> m "Number of users retrieved so far: %d" (List.length all_data));
+      (match Util.(json |> member "cursor" |> to_string_option) with
+       | Some next_cursor ->
+           Logs.info (fun m -> m "Fetching next page of users...");
+           Lwt_unix.sleep 1.0 >>= fun () -> fetch_paginated_data token did endpoint (Some next_cursor) all_data
+       | None ->
+           Logs.info (fun m -> m "All users retrieved. Total: %d" (List.length all_data));
+           Lwt.return all_data)
+  | Error e -> Logs.err (fun m -> m "Error fetching data: %s" e); Lwt.return acc
 
-let rec get_following token did ?(cursor=None) acc =
-  Logs.info (fun m -> m "Fetching following users...");
-  let headers = Cohttp.Header.of_list [("Authorization", "Bearer " ^ token)] in
-  let url = match cursor with
-    | None -> Uri.of_string (api_url ^ "/app.bsky.graph.getFollows?actor=" ^ did)
-    | Some cursor -> Uri.of_string (api_url ^ "/app.bsky.graph.getFollows?actor=" ^ did ^ "&cursor=" ^ cursor)
-  in
-  Cohttp_lwt_unix.Client.get ~headers url
-  >>= fun (resp, body) ->
-  Cohttp_lwt.Body.to_string body >>= fun body_str ->
-  Logs.debug (fun m -> m "Response for following users received: %s" body_str);
-  if Cohttp.Response.status resp |> Cohttp.Code.code_of_status = 200 then
-    let json = from_string body_str in
-    let following = Util.(json |> member "follows" |> to_list) in
-    let all_following = acc @ following in
-    Logs.info (fun m -> m "Number of following users retrieved so far: %d" (List.length all_following));
-    match Util.(json |> member "cursor" |> to_string_option) with
-    | Some next_cursor ->
-        Logs.info (fun m -> m "Fetching next page of following users...");
-        get_following token did ~cursor:(Some next_cursor) all_following
-    | None ->
-        Logs.info (fun m -> m "All following users retrieved. Total: %d" (List.length all_following));
-        Lwt.return all_following
-  else (
-    Logs.err (fun m -> m "Failed to retrieve following users. Response: %s" body_str);
-    Lwt.return acc
-  )
-  
-let rec get_followers token did ?(cursor=None) acc =
-  Logs.info (fun m -> m "Fetching followers...");
-  let headers = Cohttp.Header.of_list [("Authorization", "Bearer " ^ token)] in
-  let url = match cursor with
-    | None -> Uri.of_string (api_url ^ "/app.bsky.graph.getFollowers?actor=" ^ did)
-    | Some cursor -> Uri.of_string (api_url ^ "/app.bsky.graph.getFollowers?actor=" ^ did ^ "&cursor=" ^ cursor)
-  in
-  Cohttp_lwt_unix.Client.get ~headers url
-  >>= fun (resp, body) ->
-  Cohttp_lwt.Body.to_string body >>= fun body_str ->
-  Logs.debug (fun m -> m "Response for followers received: %s" body_str);
-  if Cohttp.Response.status resp |> Cohttp.Code.code_of_status = 200 then
-    let json = from_string body_str in
-    let followers = Util.(json |> member "followers" |> to_list) in
-    let all_followers = acc @ followers in
-    Logs.info (fun m -> m "Number of followers retrieved so far: %d" (List.length all_followers));
-    match Util.(json |> member "cursor" |> to_string_option) with
-    | Some next_cursor ->
-        Logs.info (fun m -> m "Fetching next page of followers...");
-        get_followers token did ~cursor:(Some next_cursor) all_followers
-    | None ->
-        Logs.info (fun m -> m "All followers retrieved. Total: %d" (List.length all_followers));
-        Lwt.return all_followers
-  else (
-    Logs.err (fun m -> m "Failed to retrieve followers. Response: %s" body_str);
-    Lwt.return acc
-  )
+let get_followers token did = fetch_paginated_data token did "/app.bsky.graph.getFollowers" None []
+let get_following token did = fetch_paginated_data token did "/app.bsky.graph.getFollows" None []
 
 let resolve_handle_to_did handle token =
   Logs.info (fun m -> m "Resolving handle to DID for user: %s" handle);
   let headers = Cohttp.Header.of_list [("Authorization", "Bearer " ^ token)] in
   let uri = Uri.of_string (api_url ^ "/app.bsky.actor.getProfile?actor=" ^ handle) in
-  Cohttp_lwt_unix.Client.get ~headers uri
-  >>= fun (resp, body) ->
-  Cohttp_lwt.Body.to_string body >|= fun body_str ->
-  Logs.debug (fun m -> m "Response for resolving handle to DID: %s" body_str);
-  if Cohttp.Response.status resp |> Cohttp.Code.code_of_status = 200 then
-    let json = Yojson.Safe.from_string body_str in
-    Util.(json |> member "did" |> to_string_option)
-  else (
-    Logs.err (fun m -> m "Failed to resolve handle to DID for %s. Response: %s" handle body_str);
-    None
-  )
+  make_request ~method_:`GET ~headers uri
+  >>= fun response ->
+  match handle_response ~action:("resolve handle to DID for " ^ handle) response with
+  | Ok json -> Lwt.return (Util.(json |> member "did" |> to_string_option))
+  | Error _ -> Lwt.return None
+
+let perform_action token action user_data =
+  let headers = Cohttp.Header.of_list [("Authorization", "Bearer " ^ token); ("Content-Type", "application/json")] in
+  let body = to_string (`Assoc user_data) in
+  let uri = Uri.of_string (api_url ^ (if action = "follow" then "/com.atproto.repo.createRecord" else "/com.atproto.repo.deleteRecord")) in
+
+  make_request ~method_:`POST ~headers ~body:(Cohttp_lwt.Body.of_string body) uri
+  >>= fun response ->
+  match handle_response ~action:(action ^ " user") response with
+  | Ok _ -> Logs.info (fun m -> m "Successfully performed %s action." action); Lwt.return_unit
+  | Error e -> Logs.err (fun m -> m "Failed to perform %s action: %s" action e); Lwt.return_unit
 
 let follow token did handle =
   Logs.info (fun m -> m "Following user: %s" handle);
   resolve_handle_to_did handle token >>= function
-  | Some subject_did -> (
-      let headers = Cohttp.Header.of_list [("Authorization", "Bearer " ^ token); ("Content-Type", "application/json")] in
+  | Some subject_did ->
       let created_at = now () |> Ptime.to_rfc3339 ~tz_offset_s:0 in
-      let body = `Assoc [
-          ("repo", `String did);
-          ("collection", `String "app.bsky.graph.follow");
-          ("record", `Assoc [
-              ("subject", `String subject_did);
-              ("createdAt", `String created_at)
-            ])
-        ] |> to_string in
-
-      Cohttp_lwt_unix.Client.post ~headers ~body:(Cohttp_lwt.Body.of_string body) (Uri.of_string (api_url ^ "/com.atproto.repo.createRecord"))
-      >>= fun (resp, body) ->
-      Cohttp_lwt.Body.to_string body >|= fun body_str ->
-      Logs.debug (fun m -> m "Response for follow user %s: %s" handle body_str);
-      if Cohttp.Response.status resp |> Cohttp.Code.code_of_status = 200 then
-        Logs.info (fun m -> m "Successfully followed %s." handle)
-      else
-        Logs.err (fun m -> m "Failed to follow %s. Response: %s" handle body_str)
-    )
-  | None ->
+      let user_data = [
+        ("repo", `String did);
+        ("collection", `String "app.bsky.graph.follow");
+        ("record", `Assoc [
+            ("subject", `String subject_did);
+            ("createdAt", `String created_at)
+          ])
+      ] in
+      Logs.debug (fun m -> m "Sending follow request with data: %s" (to_string (`Assoc user_data)));
+      perform_action token "follow" user_data >>= fun () ->
+      Lwt.return_unit
+  | None -> 
       Logs.err (fun m -> m "Could not resolve DID for handle %s. Cannot follow user." handle);
       Lwt.return_unit
-
+    
 let unfollow token did record_key =
   Logs.info (fun m -> m "Unfollowing user with record key: %s" record_key);
-  let headers = Cohttp.Header.of_list [("Authorization", "Bearer " ^ token); ("Content-Type", "application/json")] in
-  let body = `Assoc [
-      ("repo", `String did);
-      ("rkey", `String record_key);
-      ("collection", `String "app.bsky.graph.follow")
-    ] |> to_string in
-
-  let uri = Uri.of_string (api_url ^ "/com.atproto.repo.deleteRecord") in
-
-  Cohttp_lwt_unix.Client.post ~headers ~body:(Cohttp_lwt.Body.of_string body) uri
-  >>= fun (resp, body) ->
-  Cohttp_lwt.Body.to_string body >|= fun body_str ->
-  Logs.debug (fun m -> m "Response for unfollowing user with record key %s: %s" record_key body_str);
-  if Cohttp.Response.status resp |> Cohttp.Code.code_of_status = 200 then
-    Logs.info (fun m -> m "Successfully unfollowed user with record key: %s." record_key)
-  else
-    Logs.err (fun m -> m "Failed to unfollow user with record key: %s. Response: %s" record_key body_str)
+  let user_data = [
+    ("repo", `String did);
+    ("collection", `String "app.bsky.graph.follow");
+    ("rkey", `String record_key)
+  ] in
+  Logs.debug (fun m -> m "Sending unfollow request with data: %s" (Yojson.Safe.to_string (`Assoc user_data)));
+  perform_action token "unfollow" user_data >>= fun () ->
+  Logs.info (fun m -> m "Successfully unfollowed user with record key: %s." record_key);
+  Lwt.return_unit
 
 let get_mentions token =
   Logs.info (fun m -> m "Fetching mentions...");
   let headers = Cohttp.Header.of_list [("Authorization", "Bearer " ^ token)] in
-
-  Cohttp_lwt_unix.Client.get ~headers (Uri.of_string (api_url ^ "/app.bsky.notification.listNotifications"))
-  >>= fun (resp, body) ->
-  Cohttp_lwt.Body.to_string body >|= fun body_str ->
-  Logs.debug (fun m -> m "Response for mentions received: %s" body_str);
-  if Cohttp.Response.status resp |> Cohttp.Code.code_of_status = 200 then
-    let notifications = Util.(from_string body_str |> member "notifications" |> to_list) in
-    let mentions = List.filter (fun n -> Util.(n |> member "reason" |> to_string) = "mention") notifications in
-    Logs.info (fun m -> m "Mentions retrieved successfully.");
-    mentions
-  else (
-    Logs.err (fun m -> m "Failed to retrieve mentions. Response: %s" body_str);
-    []
-  )
+  make_request ~method_:`GET ~headers (Uri.of_string (api_url ^ "/app.bsky.notification.listNotifications"))
+  >>= fun response ->
+  match handle_response ~action:"retrieve mentions" response with
+  | Ok json ->
+      let notifications = Util.(json |> member "notifications" |> to_list) in
+      let mentions = List.filter (fun n -> Util.(n |> member "reason" |> to_string) = "mention") notifications in
+      Logs.info (fun m -> m "Mentions retrieved successfully.");
+      Lwt.return mentions
+  | Error _ -> Logs.err (fun m -> m "Failed to retrieve mentions."); Lwt.return []
 
 let repost token did uri cid =
   Logs.info (fun m -> m "Reposting mention with URI: %s" uri);
@@ -181,11 +148,8 @@ let repost token did uri cid =
         ])
     ] |> to_string in
 
-  Cohttp_lwt_unix.Client.post ~headers ~body:(Cohttp_lwt.Body.of_string body) (Uri.of_string (api_url ^ "/com.atproto.repo.createRecord"))
-  >>= fun (resp, body) ->
-  Cohttp_lwt.Body.to_string body >|= fun body_str ->
-  Logs.debug (fun m -> m "Response for repost URI %s: %s" uri body_str);
-  if Cohttp.Response.status resp |> Cohttp.Code.code_of_status = 200 then
-    Logs.info (fun m -> m "Successfully reposted URI: %s." uri)
-  else
-    Logs.err (fun m -> m "Failed to repost URI: %s. Response: %s" uri body_str)
+  make_request ~method_:`POST ~headers ~body:(Cohttp_lwt.Body.of_string body) (Uri.of_string (api_url ^ "/com.atproto.repo.createRecord"))
+  >>= fun response ->
+  match handle_response ~action:("repost URI " ^ uri) response with
+  | Ok _ -> Logs.info (fun m -> m "Successfully reposted URI: %s." uri); Lwt.return_unit
+  | Error _ -> Logs.err (fun m -> m "Failed to repost URI: %s." uri); Lwt.return_unit
