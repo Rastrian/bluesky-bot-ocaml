@@ -4,7 +4,7 @@ This is an automated bot for Bluesky, built with OCaml. It automatically follows
 
 ## Features
 
-- Automatically follows new followers and unfollows users who have unfollowed ([unfollow functionatily not working yet](https://bsky.app/profile/rastrian.dev/post/3l2zxgq7mkn23), by that handled via discord webhook just for history)
+- Automatically follows new followers and unfollows users who have unfollowed.
 - Reposts mentions that include "cc @userhandle" in the text
 - Uses Redis for state management
 - Configurable through environment variables
